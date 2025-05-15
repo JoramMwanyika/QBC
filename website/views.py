@@ -1,5 +1,5 @@
 from flask_login import login_required, current_user
-from flask import Blueprint, render_template, request, redirect, url_for, flash, abort, jsonify
+from flask import Blueprint, render_template, request, redirect, url_for, flash, abort, jsonify, session
 from sqlalchemy import func
 import json
 from . import db
@@ -220,10 +220,10 @@ def admin_analytics():
     return render_template('admin/analytics.html')
 
 @views.route('/admin/analytics/data')
-@login_required  # If applicable
+@login_required
 @admin_required
 def admin_analytics_data():
-        # Exclude admins from student count
+    # Exclude admins from student count
     total_students = User.query.filter_by(is_admin=False).count()
     
     total_subjects = Subject.query.count()
@@ -248,17 +248,8 @@ def admin_analytics_data():
     ).filter(User.is_admin == False).group_by(User.qualification).all()
 
     qualification_distribution_data = [
-        {"qualification": qualification, "count": count}
-        for qualification, count in qualification_distribution
-    ]
-
-    # Performance Distribution (Excluding Admins)
-    performance_distribution = db.session.query(
-        Score.total_score, func.count(Score.id)
-    ).join(User).filter(User.is_admin == False).group_by(Score.total_score).all()
-
-    performance_distribution_data = [
-        {"score": score, "count": count} for score, count in performance_distribution
+        {"qualification": qual, "count": count}
+        for qual, count in qualification_distribution
     ]
 
     return jsonify({
@@ -267,309 +258,286 @@ def admin_analytics_data():
         "total_quizzes": total_quizzes,
         "active_quizzes": active_quizzes,
         "subject_performance": subject_performance_data,
-        "qualification_distribution": qualification_distribution_data,
-        "performance_distribution": performance_distribution_data
+        "qualification_distribution": qualification_distribution_data
     })
 
-@admin_required
-@login_required
 @views.route('/admin/quiz/<int:quiz_id>/toggle_publish', methods=['POST'])
+@login_required
+@admin_required
 def toggle_publish(quiz_id):
     quiz = Quiz.query.get_or_404(quiz_id)
     quiz.published = not quiz.published
     db.session.commit()
-    return redirect(request.referrer)
-
+    status = "published" if quiz.published else "unpublished"
+    flash(f"Quiz {status} successfully!", "success")
+    return redirect(url_for("views.view_quizzes", chapter_id=quiz.chapter_id))
 
 @views.route("/user")
 @login_required
 @user_required
 def user_dashboard():
-    quizzes = (
-        db.session.query(
-            Quiz.id,
-            Chapter.name.label("chapter_name"),
-            Subject.name.label("subject_name"),
-            db.func.count(Question.id).label("total_questions"),
-            db.func.coalesce(
-                db.session.query(Score.total_score)
-                .filter(Score.user_id == current_user.id, Score.quiz_id == Quiz.id)
-                .order_by(Score.time_stamp_of_attempt.desc())
-                .limit(1)
-                .scalar_subquery(),
-                None
-            ).label("latest_score")
-        )
-        .join(Chapter, Quiz.chapter_id == Chapter.id)
-        .join(Subject, Chapter.subject_id == Subject.id)
-        .outerjoin(Question, Question.quiz_id == Quiz.id)
-        .filter(Quiz.published == True)  # Ensure only published quizzes are fetched
-        .group_by(Quiz.id, Chapter.name, Subject.name)
-        .all()
-    )
-
-    return render_template("user/dashboard.html", quizzes=quizzes)
-
+    # Get all subjects that match the user's qualification
+    subjects = Subject.query.filter_by(qualification=current_user.qualification).all()
+    
+    # For each subject, get its chapters and quizzes
+    subject_data = []
+    for subject in subjects:
+        chapters = Chapter.query.filter_by(subject_id=subject.id).all()
+        chapter_data = []
+        
+        for chapter in chapters:
+            quizzes = Quiz.query.filter_by(chapter_id=chapter.id, published=True).all()
+            quiz_data = []
+            
+            for quiz in quizzes:
+                # Check if user has already taken this quiz
+                score = Score.query.filter_by(user_id=current_user.id, quiz_id=quiz.id).first()
+                quiz_data.append({
+                    'id': quiz.id,
+                    'time_duration': quiz.time_duration,
+                    'remarks': quiz.remarks,
+                    'score': score.total_score if score else None,
+                    'taken': score is not None
+                })
+            
+            chapter_data.append({
+                'id': chapter.id,
+                'name': chapter.name,
+                'description': chapter.description,
+                'quizzes': quiz_data
+            })
+        
+        subject_data.append({
+            'id': subject.id,
+            'name': subject.name,
+            'description': subject.description,
+            'chapters': chapter_data
+        })
+    
+    return render_template("user/dashboard.html", subjects=subject_data)
 
 @views.route("/user/quiz/<int:quiz_id>", methods=["GET"])
 @login_required
 @user_required
 def start_quiz(quiz_id):
     quiz = Quiz.query.get_or_404(quiz_id)
-
-    # Check if the user has already attempted the quiz
-    previous_attempt = Score.query.filter_by(user_id=current_user.id, quiz_id=quiz_id).first()
-    if previous_attempt:
-        flash("You have already attempted this quiz. Multiple attempts are not allowed. Ask admin - qbc_admin@fastmail.com", "warning")
+    
+    # Check if quiz is published
+    if not quiz.published:
+        flash("This quiz is not available yet.", "error")
         return redirect(url_for("views.user_dashboard"))
-
+    
+    # Check if user has already taken this quiz
+    existing_score = Score.query.filter_by(user_id=current_user.id, quiz_id=quiz.id).first()
+    if existing_score:
+        flash("You have already taken this quiz.", "error")
+        return redirect(url_for("views.user_dashboard"))
+    
+    # Get all questions for this quiz
     questions = Question.query.filter_by(quiz_id=quiz.id).all()
+    
+    if not questions:
+        flash("This quiz has no questions yet.", "error")
+        return redirect(url_for("views.user_dashboard"))
+    
+    return render_template(
+        "quizzes/take_quiz.html",
+        quiz=quiz,
+        questions=questions,
+        time_duration=quiz.time_duration
+    )
 
-    # Attach options to each question
-    for question in questions:
-        question.options = question.get_options()  # Ensure each question has an options dict
-
-    # Flash a warning alert before quiz starts
-    flash("⚠️ Before you start, ensure a stable internet connection and avoid switching tabs. Any violations may auto-submit your quiz.", "info")
-
-    return render_template("quizzes/quiz_page.html", quiz=quiz, questions=questions)
-
-
-
-
-# @views.route("/user/quiz/submit", methods=["POST"])
-# @login_required
-# @user_required
-# def submit_quiz():
-#     quiz_id = request.form.get("quiz_id")  # Get quiz_id from form-data
-
-#     if not quiz_id:  # Debugging issue
-#         return jsonify({"success": False, "message": "Error: Quiz ID is missing!"}), 400
-
-#     responses = {key.replace("question_", ""): value for key, value in request.form.items() if key.startswith("question_")}
-
-#     # Fetch relevant questions
-#     questions = Question.query.filter(Question.quiz_id == quiz_id, Question.id.in_(map(int, responses.keys()))).all()
-
-#     correct_answers = sum(1 for q in questions if q.correct_option.upper() == responses.get(str(q.id), "").strip().upper())
-
-#     # Store the score
-#     score = Score(user_id=current_user.id, quiz_id=int(quiz_id), total_score=correct_answers)
-#     db.session.add(score)
-#     db.session.commit()
-
-#     return jsonify({"success": True, "message": "Quiz submitted successfully!", "score": correct_answers})
-
-@user_required
 @views.route('/user/analytics')
 @login_required
+@user_required
 def user_analytics():
     return render_template('user/analytics.html')
 
-@user_required
 @views.route('/user/analytics/data')
 @login_required
+@user_required
 def user_analytics_data():
-    user_id = current_user.id  # Fetch logged-in user ID
-
-    # Total quizzes attempted by the user
-    quizzes_attempted = Score.query.filter_by(user_id=user_id).count()
-
-    # Average score of the user
-    avg_score = db.session.query(db.func.avg(Score.total_score))\
-        .filter_by(user_id=user_id).scalar() or 0
-
-    # Performance per subject
+    # Get all scores for the current user
+    scores = Score.query.filter_by(user_id=current_user.id).all()
+    
+    # Calculate total quizzes taken
+    total_quizzes = len(scores)
+    
+    # Calculate average score
+    avg_score = sum(score.total_score for score in scores) / total_quizzes if total_quizzes > 0 else 0
+    
+    # Get subject-wise performance
     subject_performance = db.session.query(
-        Subject.name, db.func.avg(Score.total_score)
-    ).select_from(Score)\
-     .join(Quiz, Quiz.id == Score.quiz_id)\
-     .join(Subject, Subject.id == Quiz.id)\
-     .filter(Score.user_id == user_id)\
-     .group_by(Subject.name)\
-     .all()
-
-    # Convert subject performance data into JSON serializable format
-    subject_performance_data = [
-        {"subject": subject, "avg_score": round(avg_score, 2)}
+        Subject.name,
+        func.avg(Score.total_score).label('avg_score')
+    ).join(Chapter).join(Quiz).join(Score).filter(
+        Score.user_id == current_user.id
+    ).group_by(Subject.id).all()
+    
+    subject_data = [
+        {"subject": subject, "avg_score": avg_score}
         for subject, avg_score in subject_performance
     ]
-
-    # Fetch last 5 quiz attempts with timestamps
-    past_performance = Score.query.filter_by(user_id=user_id)\
-        .order_by(Score.time_stamp_of_attempt.desc())\
-        .limit(5)\
-        .all()
-
-    # Convert past performance data
-    past_performance_data = [
-        {"timestamp": p.time_stamp_of_attempt.strftime("%Y-%m-%d %H:%M:%S"), "score": p.total_score}
-        for p in past_performance
-    ]
-
+    
     return jsonify({
-        "quizzes_attempted": quizzes_attempted,
-        "avg_score": round(avg_score, 2),
-        "subject_performance": subject_performance_data,
-        "past_performance": past_performance_data
+        "total_quizzes": total_quizzes,
+        "average_score": avg_score,
+        "subject_performance": subject_data
     })
-
-
 
 @views.route("/user/quiz/submit", methods=["POST"])
 @login_required
 @user_required
 def submit_quiz():
-    quiz_id = request.form.get("quiz_id")
+    data = request.get_json()
+    quiz_id = data.get('quiz_id')
+    answers = data.get('answers', {})
     
-    if not quiz_id:
-        return jsonify({"success": False, "message": "Error: Quiz ID is missing!"}), 400
+    quiz = Quiz.query.get_or_404(quiz_id)
+    questions = Question.query.filter_by(quiz_id=quiz_id).all()
     
-    responses = {
-        key.replace("question_", ""): value 
-        for key, value in request.form.items() if key.startswith("question_")
-    }
-
-    questions = Question.query.filter(Question.quiz_id == quiz_id, Question.id.in_(map(int, responses.keys()))).all()
-    
+    total_questions = len(questions)
     correct_answers = 0
-    user_answers = {}
     
-    for q in questions:
-        selected_option = responses.get(str(q.id), "").strip().upper()
-        correct_option = q.correct_option.upper()
-        
-        if selected_option == correct_option:
+    for question in questions:
+        user_answer = answers.get(str(question.id))
+        if user_answer == question.correct_option:
             correct_answers += 1
-        
-        user_answers[q.id] = selected_option  # Store user-selected answers
     
-    score = Score(user_id=current_user.id, quiz_id=int(quiz_id), total_score=correct_answers, answers=json.dumps(user_answers))
-    db.session.add(score)
+    score = (correct_answers / total_questions) * 100 if total_questions > 0 else 0
+    
+    # Save the score
+    new_score = Score(
+        user_id=current_user.id,
+        quiz_id=quiz_id,
+        total_score=score,
+        total_questions=total_questions,
+        correct_answers=correct_answers
+    )
+    db.session.add(new_score)
     db.session.commit()
     
-    flash("Quiz submitted successfully! View your performance.", "success")
-    return redirect(url_for("views.view_performance", quiz_id=quiz_id))
+    return jsonify({
+        "success": True,
+        "score": score,
+        "total_questions": total_questions,
+        "correct_answers": correct_answers
+    })
 
 @views.route("/user/quiz/performance/<int:quiz_id>")
 @login_required
 @user_required
 def view_performance(quiz_id):
-    score = Score.query.filter_by(user_id=current_user.id, quiz_id=quiz_id).order_by(Score.time_stamp_of_attempt.desc()).first()
-    if not score:
-        flash("No performance data available for this quiz.", "warning")
-        return redirect(url_for("views.user_dashboard"))
+    score = Score.query.filter_by(user_id=current_user.id, quiz_id=quiz_id).first_or_404()
+    quiz = Quiz.query.get_or_404(quiz_id)
     
-    questions = Question.query.filter_by(quiz_id=quiz_id).all()
-    
-    # Ensure valid JSON parsing and handle empty string
-    try:
-        user_answers = json.loads(score.answers) if score.answers else {}
-    except json.JSONDecodeError:
-        user_answers = {}
-    
-    return render_template("user/performance.html", questions=questions, user_answers=user_answers, score=score)
+    return render_template(
+        "user/performance.html",
+        score=score,
+        quiz=quiz
+    )
 
 @views.route("/profile")
 @login_required
 def profile():
-    return render_template("user/profile.html", user=current_user)
+    return render_template("user/profile.html")
 
 @views.route("/edit-profile", methods=["GET", "POST"])
 @login_required
 def edit_profile():
     if request.method == "POST":
         full_name = request.form.get("full_name")
-        dob_str = request.form.get("dob")
-        qualification = request.form.get("qualification")
-        password = request.form.get("password")
-
+        email = request.form.get("email")
+        
+        # Check if email is already taken by another user
+        existing_user = User.query.filter(User.email == email, User.id != current_user.id).first()
+        if existing_user:
+            flash("Email already taken!", "error")
+            return redirect(url_for("views.edit_profile"))
+        
         current_user.full_name = full_name
-        # Convert it to a datetime.date object
-        dob = datetime.strptime(dob_str, '%Y-%m-%d').date()
-        current_user.dob = dob
-        current_user.qualification = qualification
-
-        if password:
-            current_user.password = generate_password_hash(password, method='sha256')
-
-        try:
-            db.session.commit()
-            flash("Profile updated successfully!", "success")
-        except Exception as e:
-            db.session.rollback()
-            flash(f"An error occurred: {str(e)}", "danger")
-
+        current_user.email = email
+        db.session.commit()
+        flash("Profile updated successfully!", "success")
         return redirect(url_for("views.profile"))
-
-    return render_template("user/edit_profile.html", user=current_user)
+    
+    return render_template("user/edit_profile.html")
 
 @views.route('/change_password', methods=['GET', 'POST'])
 @login_required
 def change_password():
-    if request.method == 'POST':
-        current_pwd = request.form['current_password']
-        new_pwd = request.form['new_password']
-        confirm_pwd = request.form['confirm_password']
-
-        if not check_password_hash(current_user.password, current_pwd):
-            flash('Current password is incorrect', 'error')
-            return redirect(url_for('views.change_password'))
-
-        if new_pwd != confirm_pwd:
-            flash('New passwords do not match', 'error')
-            return redirect(url_for('views.change_password'))
-
-        current_user.password = generate_password_hash(new_pwd)
-        db.session.commit()
-        flash('Password updated successfully', 'success')
-        return redirect(url_for('views.profile', user_id=current_user.id))
-
+    if request.method == "POST":
+        current_password = request.form.get("current_password")
+        new_password = request.form.get("new_password")
+        confirm_password = request.form.get("confirm_password")
+        
+        if not check_password_hash(current_user.password, current_password):
+            flash("Current password is incorrect!", "error")
+        elif new_password != confirm_password:
+            flash("New passwords don't match!", "error")
+        elif len(new_password) < 8:
+            flash("Password must be at least 8 characters long!", "error")
+        else:
+            current_user.password = generate_password_hash(new_password)
+            db.session.commit()
+            flash("Password changed successfully!", "success")
+            return redirect(url_for("views.profile"))
+    
     return render_template("user/change_password.html")
 
 @views.route("/admin/profile")
 @login_required
 @admin_required
 def admin_profile():
-    return render_template("admin/profile.html", admin=current_user)
+    return render_template("admin/profile.html")
 
 @views.route("/admin/profile/edit", methods=["GET", "POST"])
 @login_required
 @admin_required
 def edit_admin_profile():
     if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").strip()
-
-        current_user.full_name = name
+        full_name = request.form.get("full_name")
+        email = request.form.get("email")
+        
+        # Check if email is already taken by another user
+        existing_user = User.query.filter(User.email == email, User.id != current_user.id).first()
+        if existing_user:
+            flash("Email already taken!", "error")
+            return redirect(url_for("views.edit_admin_profile"))
+        
+        current_user.full_name = full_name
         current_user.email = email
-
         db.session.commit()
         flash("Profile updated successfully!", "success")
         return redirect(url_for("views.admin_profile"))
-
-    return render_template("admin/edit_admin_profile.html", admin=current_user)
+    
+    return render_template("admin/edit_profile.html")
 
 @views.route('/admin/change/password', methods=['GET', 'POST'])
 @login_required
 @admin_required
 def admin_change_password():
-    if request.method == 'POST':
-        current_pwd = request.form['current_password']
-        new_pwd = request.form['new_password']
-        confirm_pwd = request.form['confirm_password']
+    if request.method == "POST":
+        current_password = request.form.get("current_password")
+        new_password = request.form.get("new_password")
+        confirm_password = request.form.get("confirm_password")
+        
+        if not check_password_hash(current_user.password, current_password):
+            flash("Current password is incorrect!", "error")
+        elif new_password != confirm_password:
+            flash("New passwords don't match!", "error")
+        elif len(new_password) < 8:
+            flash("Password must be at least 8 characters long!", "error")
+        else:
+            current_user.password = generate_password_hash(new_password)
+            db.session.commit()
+            flash("Password changed successfully!", "success")
+            return redirect(url_for("views.admin_profile"))
+    
+    return render_template("admin/change_password.html")
 
-        if not check_password_hash(current_user.password, current_pwd):
-            flash('Current password is incorrect', 'error')
-            return redirect(url_for('views.admin_change_password'))
-
-        if new_pwd != confirm_pwd:
-            flash('New passwords do not match', 'error')
-            return redirect(url_for('views.admin_change_password'))
-
-        current_user.password = generate_password_hash(new_pwd)
-        db.session.commit()
-        flash('Password updated successfully', 'success')
-        return redirect(url_for('views.admin_profile', user_id=current_user.id))
-
-    return render_template('admin/change_password.html')
+@views.route('/set-language/<lang>')
+def set_language(lang):
+    if lang in ['en', 'sw']:
+        session['language'] = lang
+    return redirect(request.referrer or url_for('views.landing_page'))
