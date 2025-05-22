@@ -1,5 +1,5 @@
 from flask_login import login_required, current_user
-from flask import Blueprint, render_template, request, redirect, url_for, flash, abort, jsonify
+from flask import Blueprint, render_template, request, redirect, url_for, flash, abort, jsonify, session
 from sqlalchemy import func
 import json
 from . import db
@@ -20,6 +20,12 @@ def dashboard():
     if current_user.is_admin:
         return redirect(url_for("views.admin_dashboard"))
     return redirect(url_for("views.user_dashboard"))
+
+@views.route("/set-language/<lang>")
+def set_language(lang):
+    if lang in ['en', 'sw']:
+        session['language'] = lang
+    return redirect(request.referrer or url_for('views.landing_page'))
 
 #user admin page
 @views.route("/user-about")
